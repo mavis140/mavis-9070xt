@@ -28,10 +28,13 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
-/// The texture pool's blocks. A block goes only once every texture in it
-/// went: on 64 MiB, 3.5 GB of 5.5 GB of texture blocks were free in holes
-/// in run xtx-xcuts, the sweep letting textures go here and there.
-const TEXTURE_BLOCK: u64 = 16 << 20;
+/// The texture pool's blocks by default. 16 MiB saved 0.9 GB of the card
+/// (run xtx-block16b), but showed garbage 4x4 blocks in a texture in a
+/// cutscene (run xtx-census): smaller blocks go and are made again, and
+/// pieces are cut from memory that held other textures more often, where
+/// some texture is not all written before it is read. Until that is found,
+/// 64 MiB, as before.
+const TEXTURE_BLOCK: u64 = 64 << 20;
 
 /// The texture pool's block size in bytes: `VICTORY_TEXTURE_BLOCK_MB`, a
 /// power of two from 4 to 64, else [`TEXTURE_BLOCK`].
@@ -47,10 +50,10 @@ fn texture_block() -> u64 {
 }
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 1 GiB of 16 MiB texture blocks.
+/// The same while the card has room ([`room`]): 4 GiB of 64 MiB texture blocks.
 const SPARE_KEPT: usize = 64;
 /// The same on a PC of 32 GB or less (`crate::residency::limited_host_ram`):
-/// as many as are made ahead ([`ahead`]'s default): up to 832 MiB fewer
+/// as many as are made ahead ([`ahead`]'s default): up to 3.25 GiB fewer
 /// empty blocks, which on a PC whose graphics share its memory are the PC's.
 /// (Most of the 3.5 GB free in texture blocks in run xtx-xcuts were holes in
 /// blocks in use, which this does not touch: filling the fullest block first
