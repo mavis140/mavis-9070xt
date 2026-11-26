@@ -1176,6 +1176,10 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// The level `VICTORY_TEXTURE_MAX` held it to ([`capped_level`]; 0:
+    /// none), and the bytes of the larger levels it went without for that.
+    pub(crate) cap: u32,
+    saved: u64,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1392,7 +1396,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // (Not past the level `VICTORY_TEXTURE_MAX` held it to: such a copy
+    // keeps its cap until it is let go, also when the card has room again.)
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(host.cap) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1633,6 +1639,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 prefill = Some(found);
             }
         }
+        // `VICTORY_TEXTURE_MAX`: a block-compressed texture the title places
+        // in memory goes without its levels over the cap ([`capped_level`]),
+        // as one viewed from a later level goes without the larger ones; not
+        // one made level by level, and the store does not make it whole.
+        // (Such a texture is never another's alias: `alias_of` asks for
+        // texels of width 1.)
+        let held = base;
+        let mut cap = 0;
+        if shape_fits && tiled.is_none() && r.host.placed.load(Relaxed) {
+            cap = capped_level(&r.desc);
+        }
+        if cap > base {
+            base = cap;
+            prefill = None;
+        }
         let texture = match texture {
             Some(texture) => Some(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
@@ -1659,9 +1680,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        if base > held {
+            host.cap = base;
+            host.saved = capped_bytes(&r.desc, held, base);
+            for (i, n) in [1, host.saved, 1, host.saved].into_iter().enumerate() {
+                CAPPED[i].fetch_add(n, Relaxed);
+            }
+        }
         *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
-        if base > 0 {
+        if held > 0 {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
@@ -1819,6 +1847,218 @@ fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// `VICTORY_TEXTURE_MAX` as it is set ([`texture_max`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextureMax {
+    Off,
+    Pixels(u64),
+    Auto,
+}
+
+/// What `VICTORY_TEXTURE_MAX` says: unset, 0 or not a number, no cap.
+fn texture_max_of(value: Option<&str>) -> TextureMax {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("auto") => TextureMax::Auto,
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .map_or(TextureMax::Off, TextureMax::Pixels),
+        None => TextureMax::Off,
+    }
+}
+
+/// The cap per side of `VICTORY_TEXTURE_MAX=auto` while `percent` of the
+/// card's budget is in use: 1024 pixels under 70, 512 under 85, then 256.
+fn cap_for(percent: u64) -> u64 {
+    match percent {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    }
+}
+
+/// How many of its largest levels a texture of `width` by `height` texels
+/// and `mips` levels, in blocks of `block` texels a side, goes without for
+/// no side to pass `max`: one level at least stays, and each level that
+/// stays is whole blocks (else fewer go).
+fn levels_over(width: u64, height: u64, mips: u32, block: u64, max: u64) -> u32 {
+    let block = block.max(1);
+    let whole = |side: u64| side != 0 && side.is_multiple_of(block);
+    let mut skip = 0;
+    while (width.max(height) >> skip) > max
+        && skip + 1 < mips
+        && whole(width >> (skip + 1))
+        && whole(height >> (skip + 1))
+    {
+        skip += 1;
+    }
+    skip
+}
+
+/// The bytes of levels `from` to `to` (not `to`) of a texture of `width` by
+/// `height` texels in blocks of `block` texels a side and `bytes` bytes, as
+/// the host lays them out without padding.
+fn level_bytes(width: u64, height: u64, block: u64, bytes: u64, from: u32, to: u32) -> u64 {
+    let block = block.max(1);
+    (from..to)
+        .map(|k| (width >> k).max(1).div_ceil(block) * (height >> k).max(1).div_ceil(block) * bytes)
+        .sum()
+}
+
+/// The cap per side of host copies of block-compressed textures the title
+/// places in memory, in pixels; `None`: no cap, as before.
+/// `VICTORY_TEXTURE_MAX=<pixels>` sets one; `VICTORY_TEXTURE_MAX=auto` lets
+/// it follow the card's memory ([`cap_for`]: 1024 while under 70 % of the
+/// budget is in use, 512 to 85 %, then 256), in use as [`room`] counts it,
+/// asked at most every tenth of a second. A copy so capped begins at the
+/// title's first level that fits ([`capped_level`]) and keeps that until it
+/// is let go. Made for a card that is full: a Radeon RX 9070 XT of 16 GB
+/// was said to have 12.5 to 14 GB in use of a budget of 12.7 to 13 GB, some
+/// 10 GB more in the PC's memory, and 10 to 14 frames a second from the
+/// paging. Not measured here yet. After VIctory-Belobug-AMD ebd990d
+/// (`over_cap`; there on by default).
+#[cfg(windows)]
+fn texture_max() -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match texture_max_set() {
+        TextureMax::Off => None,
+        TextureMax::Pixels(n) => Some(n),
+        TextureMax::Auto => {
+            // The tenth of a second of the last asking, counted from 1, and
+            // the share in use then in the low 8 bits.
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tenth = crate::host::now_ms() / 100 + 1;
+            let last = LAST.load(Relaxed);
+            let percent = if last >> 8 == tenth {
+                last & 0xff
+            } else {
+                let percent = match crate::host::host().and_then(|h| h.video_memory()) {
+                    Some([budget, used, ..]) => {
+                        let used = used.saturating_sub(crate::pool::texture_room())
+                            + crate::shadow::card_room_kept()
+                            + targets_room_kept();
+                        (used * 100 / budget.max(1)).min(255)
+                    }
+                    None => 0,
+                };
+                LAST.store((tenth << 8) | percent, Relaxed);
+                CAPPED[4].store(percent, Relaxed);
+                percent
+            };
+            Some(cap_for(percent))
+        }
+    }
+}
+
+/// `VICTORY_TEXTURE_MAX` ([`texture_max`]), read once.
+#[cfg(windows)]
+fn texture_max_set() -> TextureMax {
+    static SET: std::sync::OnceLock<TextureMax> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| texture_max_of(std::env::var("VICTORY_TEXTURE_MAX").ok().as_deref()))
+}
+
+/// The title's level a host copy of the texture `desc` begins at under
+/// [`texture_max`] (0: all of it, as without): of a 2D block-compressed
+/// texture of one layer and several levels that the title fills, in a
+/// console layout the upload reads ([`read_from`]). Render targets, depth,
+/// unordered access, other formats, arrays, cubes and volumes keep all
+/// their levels.
+#[cfg(windows)]
+fn capped_level(desc: &ResourceDesc) -> u32 {
+    texture_max().map_or(0, |max| capped_level_at(desc, max))
+}
+
+/// [`capped_level`] for a cap of `max` pixels.
+#[cfg(windows)]
+fn capped_level_at(desc: &ResourceDesc, max: u64) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    let Some((_, block)) = element(desc.format).filter(|&(_, block)| block == 4) else {
+        return 0;
+    };
+    if !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.mip_levels <= 1
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    let mips = u32::from(desc.mip_levels);
+    let skip = levels_over(desc.width, u64::from(desc.height), mips, block, max);
+    if skip == 0 {
+        return 0;
+    }
+    let Some(t) = texture_layout(desc).filter(|t| t.planes.len() == 1) else {
+        return 0;
+    };
+    let layout = &t.planes[0].layout;
+    if layout.desc.swizzle.xor() {
+        return 0;
+    }
+    // (The levels from there on lie together in title memory, or 0.)
+    read_from(layout, skip)
+}
+
+/// The bytes of the host copy's levels `from` to `to` of texture `desc`
+/// ([`level_bytes`]).
+#[cfg(windows)]
+fn capped_bytes(desc: &ResourceDesc, from: u32, to: u32) -> u64 {
+    element(desc.format).map_or(0, |(bytes, block)| {
+        level_bytes(desc.width, u64::from(desc.height), block, bytes, from, to)
+    })
+}
+
+/// For the texture pass (`draw.rs` `heap_textures`): the level up to which
+/// a texture placed in memory with the resource description `desc` would go
+/// without its larger levels under [`texture_max`] (0: none), by sides and
+/// format alone: its memory is waited for from there on.
+#[cfg(windows)]
+pub(crate) fn placed_cap(desc: &[u32; 14]) -> u32 {
+    let Some(max) = texture_max() else {
+        return 0;
+    };
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    const TEXTURE_2D: u32 = 3;
+    let one = fills(&d)
+        && d.dimension == TEXTURE_2D
+        && d.depth_or_array_size == 1
+        && d.sample_count <= 1;
+    match element(d.format) {
+        Some((_, 4)) if one => {
+            levels_over(d.width, u64::from(d.height), u32::from(d.mip_levels), 4, max)
+        }
+        _ => 0,
+    }
+}
+
+/// `VICTORY_TEXTURE_MAX`, for its line: host copies capped since the start
+/// and the bytes of the levels they went without; alive of them and their
+/// such bytes; the share of the card's budget in use at the last asking of
+/// `auto`.
+#[cfg(windows)]
+pub(crate) static CAPPED: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The line of [`CAPPED`], with the memory lines; `None` without a cap.
+#[cfg(windows)]
+pub(crate) fn cap_line() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let max = texture_max()?;
+    let [made, saved, alive, alive_saved, percent] = CAPPED.each_ref().map(|c| c.load(Relaxed));
+    let why = match texture_max_set() {
+        TextureMax::Auto => format!("auto: {percent} % of the card's budget in use at the last look"),
+        _ => "set".to_owned(),
+    };
+    Some(format!(
+        "textures capped (VICTORY_TEXTURE_MAX), since the start: {made} host copies made without their levels over the cap \
+         ({} MB of the card's left out); {alive} of them alive ({} MB left out); the cap now {max} pixels a side ({why})",
+        saved >> 20,
+        alive_saved >> 20
+    ))
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2343,6 +2583,8 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            cap: 0,
+            saved: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2370,6 +2612,8 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            cap: 0,
+            saved: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2390,6 +2634,10 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if self.cap > 0 {
+            CAPPED[2].fetch_sub(1, Relaxed);
+            CAPPED[3].fetch_sub(self.saved, Relaxed);
         }
     }
 }
@@ -4598,6 +4846,71 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// `VICTORY_TEXTURE_MAX`: unset, 0 and words other than `auto` set no
+    /// cap; `auto` follows the card's memory, 1024, 512 and then 256.
+    #[test]
+    fn texture_max_is_off_unless_set() {
+        assert_eq!(texture_max_of(None), TextureMax::Off);
+        assert_eq!(texture_max_of(Some("")), TextureMax::Off);
+        assert_eq!(texture_max_of(Some("0")), TextureMax::Off);
+        assert_eq!(texture_max_of(Some("big")), TextureMax::Off);
+        assert_eq!(texture_max_of(Some(" 2048 ")), TextureMax::Pixels(2048));
+        assert_eq!(texture_max_of(Some("Auto")), TextureMax::Auto);
+        assert_eq!([0, 69, 70, 84, 85, 100, 255].map(cap_for), [1024, 1024, 512, 512, 256, 256, 256]);
+    }
+
+    /// The levels a cap takes: down to the first that fits, one level at
+    /// least left, and none that is not whole blocks.
+    #[test]
+    fn a_cap_takes_the_levels_over_it() {
+        assert_eq!(levels_over(4096, 4096, 13, 4, 1024), 2);
+        assert_eq!(levels_over(4096, 4096, 13, 4, 256), 4);
+        assert_eq!(levels_over(4096, 1024, 13, 4, 1024), 2);
+        assert_eq!(levels_over(1024, 1024, 11, 4, 1024), 0);
+        assert_eq!(levels_over(1024, 1024, 11, 4, 2048), 0);
+        // (500 is whole blocks, 250 is not.)
+        assert_eq!(levels_over(1000, 1000, 10, 4, 256), 1);
+        // One level of two left.
+        assert_eq!(levels_over(64, 64, 2, 4, 16), 1);
+        assert_eq!(levels_over(64, 64, 1, 4, 16), 0);
+        // 16 texels a side: no level of 2 is whole blocks.
+        assert_eq!(levels_over(16, 16, 5, 4, 1), 2);
+        // A 1024 BC7 level is 256 by 256 blocks of 16 bytes; the 4x4 level one block.
+        assert_eq!(level_bytes(1024, 1024, 4, 16, 0, 1), 1 << 20);
+        assert_eq!(level_bytes(1024, 1024, 4, 16, 0, 2), (1 << 20) + (1 << 18));
+        assert_eq!(level_bytes(1024, 1024, 4, 16, 8, 9), 16);
+        assert_eq!(level_bytes(1024, 1024, 4, 16, 9, 11), 32);
+        assert_eq!(level_bytes(1024, 1024, 4, 16, 2, 2), 0);
+    }
+
+    /// Of a placed BC7 texture the cap takes the levels over it; of a render
+    /// target, an array or another format none.
+    #[cfg(windows)]
+    #[test]
+    fn a_cap_holds_block_compressed_textures_only() {
+        let at = |words: [u32; 14], max| {
+            // SAFETY: 56 bytes in the description's layout.
+            let d = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+            capped_level_at(&d, max)
+        };
+        // 256x256 BC7, nine levels, 4 KiB blocks (as below).
+        let bc7 = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        assert_eq!(at(bc7, 64), 2);
+        assert_eq!(at(bc7, 256), 0);
+        let mut target = bc7;
+        target[12] = 1;
+        assert_eq!(at(target, 64), 0);
+        let mut array = bc7;
+        array[7] = 0x9_0002;
+        assert_eq!(at(array, 64), 0);
+        let mut rgba = bc7;
+        rgba[8] = 28;
+        assert_eq!(at(rgba, 64), 0);
+        let mut one = bc7;
+        one[7] = 0x1_0001;
+        assert_eq!(at(one, 64), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

@@ -2474,7 +2474,10 @@ impl State {
             let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(&desc);
+                // (Under `VICTORY_TEXTURE_MAX` the levels over the cap are
+                // not waited for: the host copy goes without them.)
+                let first =
+                    crate::resource::first_mip(&desc).max(crate::resource::placed_cap(&resource));
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
