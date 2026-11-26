@@ -28,12 +28,16 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+/// The texture pool's blocks. A block goes only once every texture in it
+/// went: on 64 MiB, 3.5 GB of 5.5 GB of texture blocks were free in holes
+/// in run xtx-xcuts, the sweep letting textures go here and there.
+const TEXTURE_BLOCK: u64 = 16 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
+/// The same while the card has room ([`room`]): 1 GiB of 16 MiB texture blocks.
 const SPARE_KEPT: usize = 64;
 /// The same on a PC of 32 GB or less (`crate::residency::limited_host_ram`):
-/// as many as are made ahead ([`ahead`]'s default): up to 3.25 GiB fewer
+/// as many as are made ahead ([`ahead`]'s default): up to 832 MiB fewer
 /// empty blocks, which on a PC whose graphics share its memory are the PC's.
 /// (Most of the 3.5 GB free in texture blocks in run xtx-xcuts were holes in
 /// blocks in use, which this does not touch: filling the fullest block first
@@ -215,11 +219,17 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// The bytes of each block.
+    block: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool::with_blocks(most, BLOCK)
+    }
+
+    const fn with_blocks(most: usize, block: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, block }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -240,7 +250,7 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block } else { self.block / 2 } {
             return None;
         }
         self.rested(now);
@@ -276,7 +286,8 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let block = self.block;
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(block)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -311,7 +322,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -335,7 +346,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -343,8 +354,9 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
+            let size = self.block;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -365,7 +377,7 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::with_blocks(SPARE_KEPT, TEXTURE_BLOCK));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -378,13 +390,13 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).blocks() as u64 * TEXTURE_BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [lock(&TEXTURES).blocks() as u64 * (TEXTURE_BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -633,9 +645,20 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
+/// The private data a texture cut from a block holds ([`give_back_with`]).
+const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// Whether `texture` was cut from a block (and may lie where another did):
+/// only such a texture takes an aliasing barrier; one made on its own
+/// (bigger than a block) is committed, which the host refuses.
+pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: a size query; no data is written with a null pointer.
+    unsafe { texture.GetPrivateData(&KEY, &mut size, None) }.is_ok()
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
@@ -680,7 +703,7 @@ pub(crate) unsafe fn texture(
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
+            SizeInBytes: TEXTURE_BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
@@ -712,7 +735,7 @@ pub(crate) unsafe fn texture(
             {
                 crate::book::made(&made, || "a texture in a block".into());
                 where_the_card_reads(&heap, &made, piece);
-                crate::book::block(&heap, &made, piece.start, BLOCK);
+                crate::book::block(&heap, &made, piece.start, TEXTURE_BLOCK);
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
                     let (submission, since) = block.unwrap_or_default();

@@ -403,6 +403,26 @@ fn own(size: usize, made: bool) {
     }
 }
 
+/// `VICTORY_BIG_TRACE=1`: where each block of 256 MiB or more is made,
+/// with a backtrace in the log (once per thread at a time: the trace
+/// itself allocates).
+fn trace_big(size: usize) {
+    thread_local! {
+        static IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if IN.get() {
+        return;
+    }
+    IN.set(true);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_BIG_TRACE").is_some_and(|v| v == "1")) {
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::warn!(mb = size >> 20, "a block of our own of 256 MiB or more made here:
+{trace}");
+    }
+    IN.set(false);
+}
+
 /// Our own blocks of [`BIG`] bytes and more alive now: where each is (0:
 /// none) and its bytes. The memory map lists the process's big allocations
 /// by size without saying whose they are (run 65: one of 544 MB, one of
@@ -416,6 +436,9 @@ const BIG: usize = 32 << 20;
 fn big(at: *mut u8, size: usize, made: bool) {
     if size < BIG {
         return;
+    }
+    if made && size >= 256 << 20 {
+        trace_big(size);
     }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
