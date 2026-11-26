@@ -33,8 +33,9 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
-/// clamped to it.
-pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// clamped to it. (As many as the largest host view heap has slots before
+/// its raw twins: 2^22 since the dynamic slots ran out in one of 2^21.)
+pub const SLOT_STRIDES_COUNT: u32 = 1 << 22;
 /// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
 /// dwords per view heap slot, the title address of the buffer view (or
 /// ray-tracing structure) there, low 32 bits first; 0 for anything else.
