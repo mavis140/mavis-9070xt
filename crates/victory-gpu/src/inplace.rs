@@ -1402,6 +1402,122 @@ pub(crate) mod tests {
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
+    /// Measurement on the real card (ignored: needs one): what a direct
+    /// command allocator and list cost in commit when made, and after
+    /// recording, closing and resetting them (an allocator keeps its
+    /// memory). `cargo test -p victory-gpu --lib -- --ignored --nocapture lists_cost`
+    #[test]
+    #[ignore]
+    fn lists_cost() {
+        use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let commit = || {
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            c.PagefileUsage as f64 / (1 << 20) as f64
+        };
+        // SAFETY: plain DXGI queries and object creation on the first card.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter = factory.EnumAdapters1(0).unwrap();
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            const N: usize = 200;
+            let before = commit();
+            let pairs: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..N)
+                .map(|_| {
+                    let a: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                    let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+                    (a, l)
+                })
+                .collect();
+            let made = commit();
+            for (a, l) in &pairs {
+                for _ in 0..300_000 {
+                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    l.OMSetStencilRef(1);
+                }
+                l.Close().unwrap();
+                a.Reset().unwrap();
+                l.Reset(a, None).unwrap();
+            }
+            let recorded = commit();
+            let shared: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let before_lists = commit();
+            let lists: Vec<ID3D12GraphicsCommandList> = (0..N)
+                .map(|_| {
+                    let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &shared, None).unwrap();
+                    l.Close().unwrap();
+                    l
+                })
+                .collect();
+            let lists_only = commit();
+            let allocators: Vec<ID3D12CommandAllocator> =
+                (0..N).map(|_| device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap()).collect();
+            let allocators_only = commit();
+            println!("commit per list alone {:.2} MB, per allocator alone {:.2} MB ({} each)", (lists_only - before_lists) / N as f64, (allocators_only - lists_only) / N as f64, lists.len() + allocators.len());
+            println!(
+                "commit per list: {:.2} MB made (allocator + list), {:.2} MB more kept after recording 600,000 commands and a reset",
+                (made - before) / N as f64,
+                (recorded - made) / N as f64
+            );
+        }
+    }
+
+    /// Measurement on the real card (ignored: needs one): what each heap
+    /// opened on a 64 KiB part of private memory costs the process in
+    /// commit, one heap per part as `place_part` opens them.
+    /// `cargo test -p victory-gpu --lib -- --ignored --nocapture heaps_opened_per_part_cost`
+    #[test]
+    #[ignore]
+    fn heaps_opened_per_part_cost() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let commit = || {
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            c.PagefileUsage as u64 >> 20
+        };
+        // SAFETY: plain DXGI queries and device creation on the first card.
+        let device: ID3D12Device = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter = factory.EnumAdapters1(0).unwrap();
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        const N: usize = 256;
+        // SAFETY: an allocation of the test's own, committed whole.
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), N * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
+        assert!(base != 0);
+        let before = commit();
+        let mut kept = Vec::new();
+        for i in 0..N {
+            let heap = open(&device, From::Part(base + i * K64, K64)).unwrap();
+            let buffer = place(&device, &heap, 0, K64 as u64).unwrap();
+            kept.push((heap, buffer));
+        }
+        let per_part = commit();
+        drop(kept);
+        let whole = open(&device, From::Part(base, N * K64)).unwrap();
+        let buffers: Vec<_> = (0..N).map(|i| place(&device, &whole, (i * K64) as u64, K64 as u64).unwrap()).collect();
+        let one_heap = commit();
+        println!(
+            "commit: {before} MB before; {N} heaps of 64 KiB each with a buffer: +{} MB ({:.2} MB a heap); after those went, one heap of all {N} parts with {} buffers: {} MB",
+            per_part - before,
+            (per_part - before) as f64 / N as f64,
+            buffers.len(),
+            one_heap as i64 - before as i64
+        );
+    }
+
     #[test]
     fn only_private_memory_committed_whole_is_a_part() {
         // SAFETY: an allocation of the test's own.

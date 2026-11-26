@@ -490,7 +490,7 @@ fn look_for_stale() {
 
 /// Sends `list` (recorded by `f`) and waits for it.
 fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
-    let (allocator, list) = host.make_prelude()?;
+    let (allocator, list) = host.make_prelude(None)?;
     // SAFETY: objects of our own, waited for before they go.
     unsafe {
         allocator.Reset().ok()?;

@@ -386,6 +386,21 @@ pub(crate) fn fallback_heaps() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
 }
 
+/// The most of the card's memory the layer plans with, in bytes
+/// (`VICTORY_CARD_BUDGET_MB`; none: what the system gives). Every rule
+/// that frees or holds back by the card's budget follows it, so a PC whose
+/// graphics share its 32 GB (no memory of the card's own) can keep the
+/// card's part near 9 GB.
+fn card_budget_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(u64::MAX, |mb| mb << 20)
+    })
+}
+
 pub(crate) fn keep_freed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
@@ -1348,6 +1363,20 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a prelude made when its list first needs one records into the
+/// list's own allocator, not one of its own. A list made on a fresh
+/// allocator costs it its first block, 1.16 MB of commit on an RX 7900 XTX
+/// (`inplace::tests::lists_cost`; a list on an allocator that has one costs
+/// 0.15 MB): 1,107 preludes held 1.3 GB in run xtx-padfix. The list's
+/// allocator is idle then (the list is closed before it is submitted) and
+/// is reset only after every submission of the list ran, which is when
+/// the prelude's commands may go too; the prelude never resets it.
+/// `VICTORY_SHARED_PRELUDE=0`: an allocator of its own, as before.
+fn shared_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy_prelude() && std::env::var_os("VICTORY_SHARED_PRELUDE").is_none_or(|v| v != "0"))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4190,13 +4219,16 @@ impl Host {
         list
     }
 
-    /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    /// An allocator and a closed list for a prelude: `shared`, the list's
+    /// own allocator ([`shared_prelude`]), or one of its own.
+    fn make_prelude(&self, shared: Option<&ID3D12CommandAllocator>) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let allocator: ID3D12CommandAllocator = match shared {
+                    Some(shared) => shared.clone(),
+                    None => self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?,
+                };
                 let list: ID3D12GraphicsCommandList =
                     self.device
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
@@ -4228,7 +4260,7 @@ impl Host {
             )?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                let _ = prelude.set(self.make_prelude(None));
             }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
@@ -4360,7 +4392,7 @@ impl Host {
             )?;
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
-        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
+        let list = || self.make_prelude(None).ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
@@ -4459,7 +4491,7 @@ impl Host {
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
         if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude(None)) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let _recording = crate::timeline::span("copies in the card's memory: the list");
@@ -4647,7 +4679,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = work.check.pop().or_else(|| self.make_prelude(None)) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -4757,9 +4789,9 @@ impl Host {
             Some(Ok((list, queue))) => (list, Some(queue)),
             Some(Err(e)) => {
                 tracing::warn!(error = %e, "no copy queue: what shaders wrote to the card's memory is fetched on the drawing queue");
-                (self.make_prelude()?, None)
+                (self.make_prelude(None)?, None)
             }
-            None => (self.make_prelude()?, None),
+            None => (self.make_prelude(None)?, None),
         };
         // SAFETY: plain objects of our own.
         unsafe {
@@ -6910,17 +6942,19 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
+        let shared = shared_prelude();
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude(shared.then_some(&self.allocator))))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures are live. A shared allocator is the list's,
+        // which only the list's reset resets.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
+            (if shared { Ok(()) } else { allocator.Reset() }).and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
@@ -9919,6 +9953,7 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        own.Budget = own.Budget.min(card_budget_cap());
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log
         // has the moment. (It fell from 11,242 MB to some 10,300 MB with
