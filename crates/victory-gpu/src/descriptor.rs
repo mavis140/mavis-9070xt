@@ -1341,6 +1341,26 @@ pub(crate) fn views_kept() -> [u64; 8] {
     ]
 }
 
+/// For the memory line: of the newest 4,096 shapes of placed views, how
+/// many distinct values each word of the resource description and of the
+/// view's description (without its address) takes. Words that take about as
+/// many values as there are shapes are what makes shapes: filler the title
+/// leaves its stack in ([`without_filler`]), or a field that changes from
+/// view to view (a buffer view's first element).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shapes_spread() -> (usize, [u16; 14], [u16; 14]) {
+    let views = views_read();
+    let newest = &views.shapes[views.shapes.len().saturating_sub(4096)..];
+    let distinct = |word: &dyn Fn(&Shape) -> u32| {
+        newest.iter().map(word).collect::<std::collections::HashSet<u32>>().len() as u16
+    };
+    (
+        newest.len(),
+        std::array::from_fn(|k| distinct(&|s: &Shape| s.1[k])),
+        std::array::from_fn(|k| distinct(&|s: &Shape| s.2[k])),
+    )
+}
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
@@ -1577,8 +1597,39 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = without_filler(false, resource, desc);
         record(handle, View::Placed(false, resource, desc));
     }
+}
+
+/// A placed view's descriptions without the filler of their layouts: words
+/// 1 and 13 of the resource description (after the dimension and at the
+/// end, as `crate::resource::texture_at` has it), and word 3 of a shader
+/// view's (before its 64-bit fields; an unordered view's has none). The
+/// title leaves there what its stack held, so one view written again was
+/// another shape each time: all 4,194,304 shapes were taken after 27
+/// minutes in the world (1.2 GB with their index), and from then on every
+/// placed view was a table entry kept for the run, 5 million of them and
+/// 2 GB more in the next ten minutes (RX 9070 XT, 32 GB, 2026-11-26). A
+/// slot written again with other filler was also another view to the host.
+/// `VICTORY_VIEW_FILLER=1` leaves the words as the title wrote them, as
+/// before; so does `VICTORY_PLACED_FILLER=1`, which keeps the filler in
+/// the placed textures' key.
+fn without_filler(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> ([u32; 14], [u32; 16]) {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kept = *KEPT.get_or_init(|| {
+        ["VICTORY_VIEW_FILLER", "VICTORY_PLACED_FILLER"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    });
+    if !kept {
+        resource[1] = 0;
+        resource[13] = 0;
+        if !unordered {
+            desc[3] = 0;
+        }
+    }
+    (resource, desc)
 }
 
 pub(crate) extern "system" fn create_placed_uav(
@@ -1588,6 +1639,7 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = without_filler(true, resource, desc);
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1984,9 +2036,12 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses (their
+        // filler words are zero: `without_filler`).
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        (resource[1], resource[13]) = (0, 0);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        desc[3] = 0;
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
@@ -2024,6 +2079,54 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// The leak of 2026-11-26: the title leaves what its stack held in the
+    /// filler words of a placed view's descriptions, so one view written
+    /// again was another shape each time. Views that differ only there are
+    /// one shape and one record; a word that is part of the view still
+    /// makes another.
+    #[test]
+    fn filler_words_make_no_new_shapes() {
+        if !inline() || without_filler(false, [1; 14], [1; 16]).0[1] != 0 {
+            return;
+        }
+        let null = std::ptr::null();
+        let (slots, other) = ([0u64; 4], [0u64; 4]);
+        let (at, beside) = (slots.as_ptr() as u64, other.as_ptr() as u64);
+        // SAFETY: both handles are slots of 32 bytes above.
+        let words = |handle: u64| unsafe { *(handle as *const [u32; 3]) };
+        // A resource description and a view no other test uses.
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x6f11_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x6f22_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        let middle = resource[2..13].to_vec();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1[2..13] == middle[..]).count();
+        create_placed_srv(null, &resource, &desc, at);
+        for n in 0..1000u32 {
+            (resource[1], resource[13], desc[3]) = (n, !n, n.wrapping_mul(0x9e37_79b9));
+            create_placed_srv(null, &resource, &desc, beside);
+            assert_eq!(words(at), words(beside), "the same record whatever the filler");
+        }
+        assert_eq!(shapes(), 1, "one shape for 1,001 fillers");
+        let Some(View::Placed(false, kept, view_kept)) = view(at) else {
+            panic!("a placed view");
+        };
+        assert_eq!((kept[1], kept[13], view_kept[3]), (0, 0, 0));
+        assert_eq!((kept[2..13].to_vec(), view_kept[4..].to_vec()), (resource[2..13].to_vec(), desc[4..].to_vec()));
+        // Word 3 of an unordered view's description is part of it (the
+        // first element's high half): kept, and another shape.
+        create_placed_uav(null, &resource, &desc, at);
+        desc[3] ^= 1;
+        create_placed_uav(null, &resource, &desc, beside);
+        assert_ne!(words(at), words(beside));
+        assert_eq!(view(beside), Some(View::Placed(true, kept, desc)));
+        // A word that is part of a shader view (its first level) too.
+        desc[4] ^= 1;
+        create_placed_srv(null, &resource, &desc, at);
+        desc[4] ^= 1;
+        create_placed_srv(null, &resource, &desc, beside);
+        assert_ne!(words(at), words(beside));
     }
 
     /// A released resource's views go stale; the same view of a new

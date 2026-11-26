@@ -1007,6 +1007,15 @@ fn log_memory() {
         mb(kept[6]),
         big_blocks(),
     );
+    // What makes the shapes of placed views: they were to be as many as the
+    // title has kinds of textures and buffers, and were all 4,194,304 taken
+    // after 27 minutes (`crate::descriptor::without_filler`).
+    let (newest, of_resource, of_view) = crate::descriptor::shapes_spread();
+    tracing::info!(
+        "memory, shapes: of the newest {newest} shapes of placed views, the distinct values of each \
+         word: the resource description {of_resource:?}, the view's without its address {of_view:?} \
+         (words 10 to 13 of it are the title's 12 to 15)"
+    );
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists
     // the title made and never used.
