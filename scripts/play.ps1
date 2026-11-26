@@ -4,8 +4,12 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+<<<<<<< HEAD
 # -Warm         does not start the title: makes the host pipelines earlier runs drew with, under these settings
 #               (`victory warm --used`; a few minutes, and the next run does not stutter while the driver makes them)
+=======
+# -Console      series-x (the default) or series-s: the console model the title sees (less memory, lower resolution)
+>>>>>>> 605569d (VICTORY_PORT_ALL, 1 MiB windows and fewer spare texture blocks on 32 GB PCs; play.ps1 -Console)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -13,7 +17,8 @@ param(
     [switch]$RayTracing,
     [switch]$Warm,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x'
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -25,6 +30,8 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # Less memory: buffers the GPU reads where the game has them, windows cut on 1 MiB (run xtx-xcuts: 26.3 GB committed, was 29.3; 49 ms a frame, was 53-58)
+    $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '1024'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
@@ -45,4 +52,8 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+<<<<<<< HEAD
 try { if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute } } finally { Pop-Location }
+=======
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
+>>>>>>> 605569d (VICTORY_PORT_ALL, 1 MiB windows and fewer spare texture blocks on 32 GB PCs; play.ps1 -Console)

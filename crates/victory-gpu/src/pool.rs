@@ -32,6 +32,13 @@ const BLOCK: u64 = 64 << 20;
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
+/// The same on a PC of 32 GB or less (`crate::residency::limited_host_ram`):
+/// as many as are made ahead ([`ahead`]'s default): up to 3.25 GiB fewer
+/// empty blocks, which on a PC whose graphics share its memory are the PC's.
+/// (Most of the 3.5 GB free in texture blocks in run xtx-xcuts were holes in
+/// blocks in use, which this does not touch: filling the fullest block first
+/// showed garbage in textures cut from holes, run xtx-xcuts2.)
+const SPARE_LIMITED: usize = 12;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -70,7 +77,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            if crate::residency::limited_host_ram() { SPARE_LIMITED } else { SPARE_KEPT }
+        }
         _ => SPARE,
     }
 }

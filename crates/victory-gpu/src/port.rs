@@ -75,7 +75,18 @@ const MOST: u64 = 512 << 20;
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1") || all())
+}
+
+/// `VICTORY_PORT_ALL=1`: renderer port #1 for all of the title's memory
+/// that is one stretch of a section, not only its 32-bit graphics memory
+/// (turns the port on by itself). For a PC whose graphics share its
+/// memory: there the copies in the card's memory and their CPU sides are
+/// the same RAM a third and a second time over, and the card reads the
+/// PC's memory as fast as its own.
+fn all() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| std::env::var("VICTORY_PORT_ALL").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.
@@ -105,7 +116,7 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    on() && at.checked_add(len).is_some_and(|end| (end <= LOW || all()) && len > 0)
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -176,7 +187,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
+    if !all() && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
     if bytes > MOST {
