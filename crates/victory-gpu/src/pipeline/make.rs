@@ -22,7 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// The driver's compiler crashed making it ([`lost_here`]): `made` is
+    /// never set, and nothing waits for it.
+    lost: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
         }
     }
 
@@ -79,7 +83,9 @@ impl Pending {
         self.made.get_or_init(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
+            CURRENT.with(|c| c.set(self));
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            CURRENT.with(|c| c.set(std::ptr::null()));
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -165,7 +171,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
+    if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
@@ -175,6 +181,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.lost.load(Ordering::Relaxed) {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -423,43 +432,109 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
+            if let Err(e) = spawn_worker(format!("victory-pipelines-{i}"), i >= workers) {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
                 running = true;
             }
         }
+        // Workers the driver's compiler took ([`lost_here`]) are replaced.
+        let replacing = std::thread::Builder::new().name("victory-pipelines-lost".into()).spawn(|| {
+            let mut replaced = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                for (lost, screens_only) in [(&LOST_WORKERS[0], false), (&LOST_WORKERS[1], true)] {
+                    for _ in 0..lost.swap(0, Ordering::Relaxed) {
+                        replaced += 1;
+                        match spawn_worker(format!("victory-pipelines-r{replaced}"), screens_only) {
+                            Ok(()) => tracing::warn!(replaced, "a pipeline worker lost to the driver's compiler is replaced"),
+                            Err(e) => tracing::warn!(error = %e, "no pipeline worker for a lost one"),
+                        }
+                    }
+                }
+            }
+        });
+        if let Err(e) = replacing {
+            tracing::warn!(error = %e, "lost pipeline workers are not replaced");
+        }
         running
     })
+}
+
+/// One worker: it takes pipelines from the queue for as long as the
+/// process lives.
+fn spawn_worker(name: String, screens_only: bool) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            WORKER.with(|w| w.set(Some(screens_only)));
+            // Below the title's own threads (loading, recording),
+            // and the streaming one, which is below normal itself
+            // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+            let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                let _ = SetThreadPriority(GetCurrentThread(), priority);
+            }
+            loop {
+                let p = next(screens_only);
+                p.make();
+                if p.was_slow.load(Ordering::Relaxed) {
+                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.slow_now -= 1;
+                    AVAILABLE.notify_all();
+                }
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        })
+        .map(|_| ())
+}
+
+thread_local! {
+    /// The pipeline this thread is making ([`Pending::make`]), for [`lost_here`].
+    static CURRENT: std::cell::Cell<*const Pending> = const { std::cell::Cell::new(std::ptr::null()) };
+    /// On a worker: whether it takes passes over the screen alone.
+    static WORKER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Workers lost to the driver's compiler and not replaced yet: the ordinary
+/// ones, and those that take passes over the screen alone.
+static LOST_WORKERS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+/// The driver's compiler crashed on this thread, which never comes back from
+/// it (`super::library`'s handler, the caller, parks it): the pipeline it was
+/// making counts as one without a host pipeline, so that nothing waits for it
+/// (a frame's whole budget, in every frame that draws with it), and a worker
+/// takes this one's place. Called from an exception handler: it takes no lock
+/// the faulting thread can hold (a worker holds none while it makes one).
+pub(super) fn lost_here() {
+    let p = CURRENT.try_with(std::cell::Cell::get).unwrap_or(std::ptr::null());
+    let worker = WORKER.try_with(std::cell::Cell::get).ok().flatten();
+    // SAFETY: set by `make` on this thread, which still borrows the pipeline:
+    // the thread stopped inside it.
+    if let Some(p) = unsafe { p.as_ref() } {
+        p.lost.store(true, Ordering::Relaxed);
+        if worker.is_some() {
+            if p.was_slow.load(Ordering::Relaxed) {
+                let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                queue.slow_now = queue.slow_now.saturating_sub(1);
+                AVAILABLE.notify_all();
+            }
+            WAITING.fetch_sub(1, Ordering::Relaxed);
+        }
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    if let Some(screens_only) = worker {
+        LOST_WORKERS[usize::from(screens_only)].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

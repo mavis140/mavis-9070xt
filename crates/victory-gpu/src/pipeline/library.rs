@@ -513,6 +513,115 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines a driver's compiler crashed on (names, one per line), in the
+/// cache folder: they are left out from then on, in this run and later ones.
+///
+/// AMD's compiler reads a null pointer making a few of the world's compute
+/// pipelines on an RX 9070 XT (driver 32.0.32029.2010: `amdxc64.dll+0x861b9f`,
+/// read of 0x8, under `CreateComputePipelineState`), which ended the process
+/// on entering the world. The guard is Belobug's (VIctory-Belobug-AMD
+/// 0d2f6a6 and 95e935d, GPL-3.0-or-later, written on that card), adapted to
+/// this tree's workers ([`super::make::lost_here`]). Delete the file to try
+/// the pipelines again, with a new driver for one.
+const CRASHED_FILE: &str = "crashed.txt";
+
+static CRASHED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Whether the driver's compiler crashed making the pipeline named `name`.
+fn crashed(name: &str) -> bool {
+    CRASHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| {
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        })
+        .contains(name)
+}
+
+/// The pipeline named `name` is left out from now on.
+fn note_crashed(name: &str) {
+    use std::io::Write;
+    CRASHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(name.to_owned());
+    let Some(dir) = DIR.get() else { return };
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "{name}");
+    }
+}
+
+thread_local! {
+    /// The pipeline the driver makes on this thread, for [`compiler_crashed`].
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes a pipeline on this thread until this is dropped. If its
+/// compiler crashes there, the pipeline is noted and left out from then on,
+/// and the thread parked: the others, and the title, go on.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Making {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Making
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    // SAFETY: the system passes the exception being dispatched.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    // Only reads and writes of the first pages, where nothing of ours or of
+    // the title is: faults our own guards take are elsewhere.
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+        || record.NumberParameters < 2
+        || record.ExceptionInformation[1] >= 0x10000
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let name = MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let label = LABEL
+        .try_with(|l| l.try_borrow().map(|l| l.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    tracing::error!(
+        name,
+        label,
+        at = ?record.ExceptionAddress,
+        "the driver's compiler crashed making a pipeline: it is left out from now on (crashed.txt in the cache folder)"
+    );
+    note_crashed(&name);
+    super::make::lost_here();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -520,8 +629,13 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if crashed(name) {
+        // E_FAIL: as a pipeline the host refuses.
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+        let _making = Making::new(name);
         create()
     };
     let wide = HSTRING::from(name);
