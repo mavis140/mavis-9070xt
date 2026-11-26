@@ -2278,6 +2278,33 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Whether the card is full enough that what it holds may be spilling into
+/// the PC's memory: at or over `VICTORY_PRESSURE_CARD_PERCENT` of its budget
+/// (70; 0: always, as before). Only then does PC memory pressure send idle
+/// texture copies away after seconds ([`let_go_idle`]).
+///
+/// The rule came from a PC whose card stood at 20.5 GB of a 16 GB budget:
+/// there the idle copies were the PC's memory. On an RX 9070 XT with 32 GB
+/// the PC is always short (0.7 to 1.6 GB free) while the card holds 9 GB of
+/// a budget of 15.4: the copies are on the card, letting them go frees no
+/// RAM, and of 541,382 let go in 21 minutes 224,883 were made and uploaded
+/// again (20 GB), with plants and textures seen coming and going
+/// (2026-11-26, run 37).
+#[cfg(windows)]
+fn card_spills(budget: u64, used: u64) -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_PRESSURE_CARD_PERCENT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(70)
+    });
+    card_spills_at(budget, used, percent)
+}
+
+/// [`card_spills`] with the share given.
+#[cfg(windows)]
+fn card_spills_at(budget: u64, used: u64, percent: u64) -> bool {
+    budget == 0 || u128::from(used) * 100 >= u128::from(budget) * u128::from(percent.min(100))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2328,7 +2355,8 @@ pub(crate) fn let_go_idle() {
     // system memory is commit too. Short of it (`VICTORY_RESIDENCY=1`), idle
     // copies go after seconds, not the 10 minutes room on the card keeps them.
     let (idle_ms, most) = match memory {
-        _ if crate::residency::pressured() => (5_000, u64::MAX),
+        Some([budget, used, ..]) if crate::residency::pressured() && card_spills(budget, used) => (5_000, u64::MAX),
+        None if crate::residency::pressured() => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -4850,6 +4878,23 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// PC memory pressure sends idle texture copies away only when the card
+    /// is full enough to be spilling: 9 GB of a budget of 15.4 is not, 9 GB
+    /// of 11.9 is, a card over its budget is, and with the share at 0 (or no
+    /// budget known) it always is, as before.
+    #[cfg(windows)]
+    #[test]
+    fn idle_textures_go_under_pressure_only_from_a_full_card() {
+        const GIB: u64 = 1 << 30;
+        let (roomy, tight) = (15_419 << 20, 11_900 << 20);
+        assert!(!card_spills_at(roomy, 9 * GIB, 70));
+        assert!(card_spills_at(tight, 9 * GIB, 70));
+        assert!(card_spills_at(16 * GIB, 20 * GIB, 70));
+        assert!(card_spills_at(roomy, GIB, 0));
+        assert!(card_spills_at(0, GIB, 70));
+        assert!(!card_spills_at(roomy, 9 * GIB, 250), "a share over 100 is 100");
     }
 
     /// `VICTORY_TEXTURE_MAX`: unset, 0 and words other than `auto` set no
