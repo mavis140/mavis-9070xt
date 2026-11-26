@@ -4,12 +4,9 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
-<<<<<<< HEAD
 # -Warm         does not start the title: makes the host pipelines earlier runs drew with, under these settings
 #               (`victory warm --used`; a few minutes, and the next run does not stutter while the driver makes them)
-=======
 # -Console      series-x (the default) or series-s: the console model the title sees (less memory, lower resolution)
->>>>>>> 605569d (VICTORY_PORT_ALL, 1 MiB windows and fewer spare texture blocks on 32 GB PCs; play.ps1 -Console)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -54,8 +51,4 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-<<<<<<< HEAD
-try { if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute } } finally { Pop-Location }
-=======
-try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
->>>>>>> 605569d (VICTORY_PORT_ALL, 1 MiB windows and fewer spare texture blocks on 32 GB PCs; play.ps1 -Console)
+try { if ($Warm) { & $victory warm --used } else { & $victory run $Exe --execute --console $Console } } finally { Pop-Location }
