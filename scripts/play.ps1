@@ -30,8 +30,10 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
-    # Less memory: buffers the GPU reads where the game has them, windows cut on 1 MiB (run xtx-xcuts: 26.3 GB committed, was 29.3; 49 ms a frame, was 53-58)
-    $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '1024'
+    # Less memory: buffers the GPU reads where the game has them, windows cut on 1 MiB (run xtx-xcuts: 26.3 GB committed, was 29.3; 49 ms a frame, was 53-58).
+    # Windows cut on 64 KiB fall between the game's unmapped pages and are read in place too, also in its private memory
+    # (run xtx-fine64: copies of game memory 2.1 GB, were 3.3; RAM 19.3 GB, was 20.4; 50 ms a frame)
+    $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_INPLACE = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
