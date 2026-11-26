@@ -32,6 +32,19 @@ const BLOCK: u64 = 64 << 20;
 /// went: on 64 MiB, 3.5 GB of 5.5 GB of texture blocks were free in holes
 /// in run xtx-xcuts, the sweep letting textures go here and there.
 const TEXTURE_BLOCK: u64 = 16 << 20;
+
+/// The texture pool's block size in bytes: `VICTORY_TEXTURE_BLOCK_MB`, a
+/// power of two from 4 to 64, else [`TEXTURE_BLOCK`].
+fn texture_block() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_BLOCK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|mb| mb.is_power_of_two() && (4..=64).contains(mb))
+            .map_or(TEXTURE_BLOCK, |mb| mb << 20)
+    })
+}
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 1 GiB of 16 MiB texture blocks.
@@ -228,6 +241,14 @@ impl<B: Clone> Pool<B> {
         Pool::with_blocks(most, BLOCK)
     }
 
+    /// The pool with blocks of `block` bytes from now on, if it has none yet.
+    fn sized(&mut self, block: u64) -> &mut Pool<B> {
+        if self.blocks.iter().all(Option::is_none) {
+            self.block = block;
+        }
+        self
+    }
+
     const fn with_blocks(most: usize, block: u64) -> Pool<B> {
         Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, block }
     }
@@ -390,13 +411,13 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * TEXTURE_BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).blocks() as u64 * texture_block()).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (TEXTURE_BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [lock(&TEXTURES).blocks() as u64 * (texture_block() >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -701,9 +722,9 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).sized(texture_block()).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: TEXTURE_BLOCK,
+            SizeInBytes: texture_block(),
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
@@ -735,7 +756,7 @@ pub(crate) unsafe fn texture(
             {
                 crate::book::made(&made, || "a texture in a block".into());
                 where_the_card_reads(&heap, &made, piece);
-                crate::book::block(&heap, &made, piece.start, TEXTURE_BLOCK);
+                crate::book::block(&heap, &made, piece.start, texture_block());
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
                     let (submission, since) = block.unwrap_or_default();
