@@ -1614,15 +1614,25 @@ pub(crate) extern "system" fn create_placed_srv(
 /// slot written again with other filler was also another view to the host.
 /// `VICTORY_VIEW_FILLER=1` leaves the words as the title wrote them, as
 /// before; so does `VICTORY_PLACED_FILLER=1`, which keeps the filler in
-/// the placed textures' key.
+/// the placed textures' key. `VICTORY_VIEW_FILLER=9` leaves the last word
+/// of the view's description alone and takes the other three out (to tell
+/// whether a slot written again with the same view, which that word had
+/// made another view to the host each time, is what a picture depends on).
 fn without_filler(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> ([u32; 14], [u32; 16]) {
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // 0: all four words taken out; 1: none; 9: all but the view's word 9.
+    static KEPT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let kept = *KEPT.get_or_init(|| {
-        ["VICTORY_VIEW_FILLER", "VICTORY_PLACED_FILLER"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+        let is = |name: &str, value: &str| std::env::var_os(name).is_some_and(|v| v == value);
+        if is("VICTORY_VIEW_FILLER", "1") || is("VICTORY_PLACED_FILLER", "1") {
+            1
+        } else if is("VICTORY_VIEW_FILLER", "9") {
+            tracing::info!("placed views keep the last word of their description as the title wrote it (VICTORY_VIEW_FILLER=9)");
+            9
+        } else {
+            0
+        }
     });
-    if !kept {
+    if kept != 1 {
         resource[1] = 0;
         resource[13] = 0;
         // The last word of the ten: no kind of unordered view reaches it
@@ -1632,10 +1642,12 @@ fn without_filler(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16])
         // the newest 4,096 shapes, 329,000 shapes nine minutes into a run.
         const TEXTURE_2D_ARRAY: u32 = 5;
         if unordered {
-            desc[9] = 0;
+            if kept != 9 {
+                desc[9] = 0;
+            }
         } else {
             desc[3] = 0;
-            if desc[1] != TEXTURE_2D_ARRAY {
+            if desc[1] != TEXTURE_2D_ARRAY && kept != 9 {
                 desc[9] = 0;
             }
         }

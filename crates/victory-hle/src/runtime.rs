@@ -269,6 +269,87 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    keep_in_memory();
+}
+
+/// A floor under the process's working set (`VICTORY_WORKING_SET_MB=<MB>`;
+/// unset: none, as before): the system does not take pages of ours below it
+/// to give them to other programs.
+///
+/// On a PC with 32 GB the title and the layer commit 31 to 33 GB, a browser
+/// and the rest another 15, and the system trims the largest process: of
+/// the title's own heaps 0.6 to 1 GB of 4.8 were in memory, of the views of
+/// its pages 1.6 to 2.3 GB of 7. Its threads then waited for the page file:
+/// 12,000 pages read in a second and frame reports of 110 to 145 ms among
+/// ones of 45, in which the card's clock said the title had not submitted
+/// for 75 ms a frame (RX 9070 XT / 32 GB, 2026-11-26, runs 31 and 32;
+/// 5,300 pages a second and one such report in the run that felt smooth).
+/// With a floor the other programs' pages go instead. It needs the right to
+/// raise a working set, which every user has; it is asked for here.
+#[cfg(windows)]
+fn keep_in_memory() {
+    let Some(mb) = std::env::var("VICTORY_WORKING_SET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+    else {
+        return;
+    };
+    #[repr(C)]
+    struct Privilege {
+        count: u32,
+        luid: [u32; 2],
+        attributes: u32,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut [u32; 2]) -> i32;
+        fn AdjustTokenPrivileges(
+            token: isize,
+            disable_all: i32,
+            new: *const Privilege,
+            length: u32,
+            previous: *mut Privilege,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetProcessWorkingSetSizeEx(process: isize, least: usize, most: usize, flags: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const THIS_PROCESS: isize = -1;
+    const TOKEN_ADJUST_PRIVILEGES_AND_QUERY: u32 = 0x20 | 0x8;
+    const SE_PRIVILEGE_ENABLED: u32 = 2;
+    const HARD_LEAST_NO_MOST: u32 = 0x1 | 0x8;
+    let name: Vec<u16> = "SeIncreaseWorkingSetPrivilege\0".encode_utf16().collect();
+    let least = mb << 20;
+    // SAFETY: plain calls on our own process and token, with our own
+    // structures; the token is closed.
+    let (granted, set, error) = unsafe {
+        let mut token = 0isize;
+        let mut granted = false;
+        if OpenProcessToken(THIS_PROCESS, TOKEN_ADJUST_PRIVILEGES_AND_QUERY, &mut token) != 0 {
+            let mut right = Privilege { count: 1, luid: [0; 2], attributes: SE_PRIVILEGE_ENABLED };
+            if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut right.luid) != 0 {
+                granted = AdjustTokenPrivileges(token, 0, &right, 0, std::ptr::null_mut(), std::ptr::null_mut()) != 0
+                    && GetLastError() == 0;
+            }
+            CloseHandle(token);
+        }
+        // (No ceiling: the second size only has to be the larger one.)
+        let set = SetProcessWorkingSetSizeEx(THIS_PROCESS, least, least + (1 << 30), HARD_LEAST_NO_MOST) != 0;
+        (granted, set, if set { 0 } else { GetLastError() })
+    };
+    tracing::info!(
+        mb,
+        granted,
+        set,
+        error,
+        "a floor under the process's working set: the system leaves that much of it in memory (VICTORY_WORKING_SET_MB)"
+    );
 }
 
 /// The title's streaming thread runs below normal priority (on the console
@@ -327,5 +408,24 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    /// `VICTORY_WORKING_SET_MB` puts a floor the system keeps under the
+    /// process's working set.
+    #[cfg(windows)]
+    #[test]
+    fn a_floor_under_the_working_set_is_set() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetProcessWorkingSetSizeEx(process: isize, least: *mut usize, most: *mut usize, flags: *mut u32) -> i32;
+        }
+        // SAFETY: read by the call below alone; no other test reads it.
+        unsafe { std::env::set_var("VICTORY_WORKING_SET_MB", "64") };
+        keep_in_memory();
+        let (mut least, mut most, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: our own process, three places of ours for the answer.
+        assert_ne!(unsafe { GetProcessWorkingSetSizeEx(-1, &mut least, &mut most, &mut flags) }, 0);
+        assert_eq!(least, 64 << 20);
+        assert_ne!(flags & 1, 0, "a floor the system keeps");
     }
 }
