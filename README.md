@@ -3,7 +3,7 @@
 A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
 itself a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
-supplies. It follows AvatarManz's `main` up to `c9c932c` (2026-11-26) and adds
+supplies. It follows AvatarManz's `main` up to `2de9980` (2026-11-26) and adds
 what one PC with an AMD RDNA 4 card and half the RAM needed to run it.
 
 ## The goal
@@ -22,9 +22,9 @@ or publisher.
 Tested on one machine only: Windows 11, AMD Ryzen 7 9800X3D, 32 GB DDR5, Radeon
 RX 9070 XT 16 GB (driver 32.0.32029.2010), the title on an NVMe drive, Series X
 profile, 2560x1440 output, ray tracing off. Nothing here has been run on an
-NVIDIA or Intel card. The numbers are from play sessions in the open world at
-night, not from a fixed scene: frame times are the medians of the layer's own
-frame reports, grouped by how many draws a frame had.
+NVIDIA or Intel card. The numbers are from play sessions in the open world, by
+day and by night, not from a fixed scene: frame times are the medians of the
+layer's own frame reports, grouped by how many draws a frame had.
 
 | | |
 |---|---|
@@ -34,7 +34,7 @@ frame reports, grouped by how many draws a frame had.
 | A session | about 17 fps over nine minutes in the world, 30 in light scenes (`scripts\play-9070xt.ps1`) |
 | The driver's shader compiler | no longer stops: 0 pipelines refused in two sessions (48 minutes), where 38 compute programs were refused in every frame before |
 | The first minutes of a run | at the session's frame rate after `-Warm` (4,336 pipelines made ahead in 310 s); 3 to 7 fps for six minutes without it |
-| Memory | 31 to 33 GB of private memory (a 32 GB PC pages), 11.4 GB of the card inside the 11.5 to 11.9 GB Windows gives the title, about 10 GB shared with it |
+| Memory | 31 to 33 GB of private memory (a 32 GB PC pages, and the frame rate jumps with it), 11.4 GB of the card inside the 11.5 to 11.9 GB Windows gives the title, about 10 GB shared with it. AvatarManz measures 45 GB of RAM for this version on his 64 GB PC |
 | Controls | pad, or keyboard and mouse (`VICTORY_MOUSE=1`: the mouse is the right stick and the triggers) |
 
 Two days of sessions on this PC went from an exit after three minutes (the
@@ -93,8 +93,11 @@ What is known to be wrong:
   through a play session.
 - One pipeline of 4,337 still ends the driver's compiler when made ahead; the
   guard refuses it.
-- Everything measured so far was at night: shadows and daylight are not judged.
+- By day, ground and walls in the sun are far too bright, white in places.
   Light in shadow is AvatarManz's stand-in; ray tracing is off.
+- Now and then a character's or a vehicle's mesh is drawn as large sheets of
+  polygons fanning out from it for a moment (seen while getting into a car and
+  at a crash). The cause is not known yet.
 - With the mouse, the Caps Lock driving layout and F8 (frees the pointer) have
   not been tried in play.
 - What AvatarManz lists still holds: trees, signs and far objects flicker in
