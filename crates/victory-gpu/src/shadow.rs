@@ -5159,6 +5159,20 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// The windows outside buffers with what was asked of them: start, bytes,
+/// the lowest and highest address asked for, and whether an ask without a
+/// length (which reads on to the window's end) was among them.
+pub(crate) fn window_asks() -> Vec<(u64, u64, u64, u64, bool)> {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    loose
+        .iter()
+        .map(|(&(start, len), w)| {
+            let asked = [0, 1].map(|i| w.asked[i].load(Ordering::Relaxed));
+            (start, len, asked[0], asked[1], w.unsized_asks.load(Ordering::Relaxed) > 0)
+        })
+        .collect()
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).

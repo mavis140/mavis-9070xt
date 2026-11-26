@@ -1199,6 +1199,47 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
     lines
 }
 
+/// Of the windows over unmapped pages: whether what was asked of each
+/// (its lowest to highest address asked, on 64 KiB pages) is one run of a
+/// section, scattered or has unmapped pages itself, apart for windows that
+/// an ask without a length read (it reads on to the window's end).
+fn holes_census(windows: &[(u64, u64, u64, u64, bool)]) -> Vec<String> {
+    let names = ["one run of a section", "scattered", "with unmapped pages", "nothing asked"];
+    // By [to_end][kind]: windows, their bytes, the asked bytes.
+    let mut t = [[(0u64, 0u64, 0u64); 4]; 2];
+    for &(start, len, lo, hi, to_end) in windows {
+        if cover(start as usize, len as usize) != Cover::Holes {
+            continue;
+        }
+        let (at, end) = (lo & !(K64 as u64 - 1), hi.next_multiple_of(K64 as u64));
+        let kind = if lo >= hi {
+            3
+        } else {
+            match cover(at as usize, (end - at) as usize) {
+                Cover::Run(..) => 0,
+                Cover::Scattered => 1,
+                _ => 2,
+            }
+        };
+        let e = &mut t[usize::from(to_end)][kind];
+        *e = (e.0 + 1, e.1 + len, e.2 + end.saturating_sub(at));
+    }
+    let mut lines = Vec::new();
+    for (to_end, by_kind) in t.iter().enumerate() {
+        for (name, &(n, bytes, asked)) in names.iter().zip(by_kind) {
+            if n > 0 {
+                lines.push(format!(
+                    "census, windows over unmapped pages{}: what was asked {name}: {n} windows of {} MB, {} MB asked",
+                    if to_end == 1 { " read to their end" } else { "" },
+                    bytes >> 20,
+                    asked >> 20
+                ));
+            }
+        }
+    }
+    lines
+}
+
 /// With [`probe_level`] 2: one part of the title's own private memory
 /// (the start of the biggest such title buffer, 4 MiB at most) is opened
 /// for a moment, a buffer placed, 64 KiB read by the GPU and compared
@@ -1290,7 +1331,8 @@ pub(crate) fn tick() {
     };
     let due = match DONE.load(Ordering::Relaxed) {
         0 => now >= started + 30_000,
-        1 => now >= started + 150_000,
+        // (`VICTORY_INPLACE_CENSUS_S`: the second census that many seconds in, 150.)
+        1 => now >= started + 1000 * std::env::var("VICTORY_INPLACE_CENSUS_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(150),
         _ => false,
     };
     if due {
@@ -1298,6 +1340,9 @@ pub(crate) fn tick() {
         std::thread::spawn(move || {
             let spans = crate::shadow::spans();
             for line in census_of(&spans) {
+                tracing::info!("in place {line}");
+            }
+            for line in holes_census(&crate::shadow::window_asks()) {
                 tracing::info!("in place {line}");
             }
             if which == 0 && probe_level() >= 2 {

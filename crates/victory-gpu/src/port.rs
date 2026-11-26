@@ -40,8 +40,8 @@
 //! stands. Opened on our view, the title's own views stay free to change.
 //! When the title maps other pages at such an address, what is in place
 //! there is let go (`crate::inplace::title_memory_freeing`) and the region
-//! forgotten; the view of ours stays (shortcut: it is never unmapped, a
-//! few hundred MB of address space at most).
+//! forgotten; the view of ours is unmapped once nothing placed in the
+//! region's heap is left ([`sweep`]).
 //!
 //! What it assumes: the CPU steps of ours that read this memory at
 //! submission (fills of constant buffers, the title's buffer copies done on
@@ -94,12 +94,20 @@ struct Region {
     start: u64,
     end: u64,
     heap: ID3D12Heap,
+    /// Our view of the stretch the heap was opened on.
+    view: usize,
 }
 
 // SAFETY: D3D12 heaps are free-threaded.
 unsafe impl Send for Region {}
 
 static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+
+/// Regions forgotten ([`forget`]) whose heap may still have buffers in it:
+/// the heap holds the pages of our view, which is unmapped after it goes.
+/// With windows on a 64 KiB grid the title's remapping forgets thousands of
+/// regions (12,993 in run xtx-fine64), each a view of ours.
+static RETIRED: Mutex<Vec<Region>> = Mutex::new(Vec::new());
 
 /// The lowest start and highest end of every region (both 0: none), for a
 /// quick look on the paths that run thousands of times a frame.
@@ -225,9 +233,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
                 view = format_args!("{view:#x}"),
                 "renderer port 1: a stretch of the title's graphics memory opened as a host heap through a view of ours"
             );
-            // shortcut: the view stays mapped for good (the heap holds its
-            // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region { start: first, end: first + bytes, heap, view })
         }
         Err(e) => {
             unmap();
@@ -266,11 +272,47 @@ pub(crate) fn forget(at: usize, len: usize) {
         return;
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let before = regions.len();
-    regions.retain(|r| r.end <= at || r.start >= end);
-    STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
+    let (gone, kept): (Vec<Region>, Vec<Region>) = std::mem::take(&mut *regions).into_iter().partition(|r| r.end > at && r.start < end);
+    *regions = kept;
+    STATS[7].fetch_add(gone.len() as u64, Ordering::Relaxed);
     bounds(&regions);
+    drop(regions);
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(gone);
+    sweep();
 }
+
+/// The references to `heap` there are, ours included.
+fn references(heap: &ID3D12Heap) -> u32 {
+    let raw = windows::core::Interface::as_raw(heap);
+    // SAFETY: a live COM object; AddRef then Release leaves the count as it
+    // was, and Release returns it.
+    unsafe {
+        let table = *raw.cast::<*const windows::core::IUnknown_Vtbl>();
+        ((*table).AddRef)(raw);
+        ((*table).Release)(raw)
+    }
+}
+
+/// Lets go of the retired regions nothing is placed in any more: the heap
+/// first, then our view of its pages.
+fn sweep() {
+    let gone: Vec<Region> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let (gone, kept) = std::mem::take(&mut *retired).into_iter().partition(|r| references(&r.heap) <= 1);
+        *retired = kept;
+        gone
+    };
+    for Region { heap, view, .. } in gone {
+        drop(heap);
+        // SAFETY: our own view; the heap opened on it is gone.
+        if unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) } != 0 {
+            UNMAPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Views of ours unmapped by [`sweep`] since the start.
+static UNMAPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
 fn touches(at: usize, len: usize) -> bool {
@@ -306,7 +348,7 @@ pub(crate) fn log(frames: f64) {
         "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
-         forgotten (other pages mapped there)",
+         forgotten (other pages mapped there), {} of their views unmapped, {} waiting for their buffers",
         s[0],
         s[1] >> 20,
         s[2],
@@ -319,6 +361,8 @@ pub(crate) fn log(frames: f64) {
         s[5],
         s[6],
         s[7],
+        UNMAPPED.load(Ordering::Relaxed),
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len(),
     );
 }
 
@@ -398,8 +442,12 @@ mod tests {
             assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the stretch");
             assert_eq!(second.bias, 0);
             // The title's views may change under the heap.
-            drop((placed, second));
+            let unmapped = UNMAPPED.load(Ordering::Relaxed);
             forget(base as usize, 8 * K);
+            assert!(UNMAPPED.load(Ordering::Relaxed) == unmapped, "our view stays while buffers are placed in its heap");
+            drop((placed, second));
+            sweep();
+            assert!(UNMAPPED.load(Ordering::Relaxed) > unmapped, "our view is unmapped once its heap is empty");
             for view in views {
                 assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");
             }
