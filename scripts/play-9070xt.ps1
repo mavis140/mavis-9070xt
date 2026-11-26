@@ -5,12 +5,15 @@
 #             Do it once after a first run, and again after a new build or driver: the run after it does not
 #             stutter while the driver makes pipelines.
 # -NoPorts    without the renderer patches (the first thing to try when draws go missing or the device is removed)
+# -Safe       play.ps1's -Safe: without the list calls translated by threads of ours. About a third slower, and
+#             without the meshes drawn as sheets of polygons that come with them (README, "What is known to be wrong")
 # -Output     the size the title renders its output at (2560x1440; 1920x1080 takes less of the card)
 # -More       other settings, as play.ps1: -More @{VICTORY_MOUSE='0'}
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Warm,
     [switch]$NoPorts,
+    [switch]$Safe,
     [string]$Output = '2560x1440',
     [hashtable]$More = @{}
 )
@@ -23,9 +26,16 @@ $settings = @{
     VICTORY_TEXTURE_LOOK_MS = '500'; VICTORY_TEXTURE_AWAY_MS = '15000'
     # The light in shadow, the mouse as the right stick with a PC key layout, and the list -Warm reads.
     VICTORY_AMBIENT_AIR = '1.5'; VICTORY_MOUSE = '1'; VICTORY_PIPELINE_BOOK = '1'
+    # The wide panel in colours (F3 shows and hides it).
+    VICTORY_PANEL = '2'
+    # play.ps1 reads title memory in place wherever it can since kripotker's memory series. On this PC (a card with
+    # memory of its own) that opened and forgot thousands of small regions while the title streamed, and the frame
+    # rate swung between 2 and 20 fps: left as before here.
+    VICTORY_PORT_ALL = '0'; VICTORY_INPLACE = '0'; VICTORY_WINDOW_KB = '4096'
 }
 if (-not $NoPorts) {
-    foreach ($port in 'CONSTANTS', 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$port"] = '1' }
+    # (Not renderer patch 1, VICTORY_PORT_CONSTANTS: with it the sky flickered between dark and light here.)
+    foreach ($port in 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$port"] = '1' }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
-& (Join-Path $PSScriptRoot 'play.ps1') -Exe $Exe -More $settings -Warm:$Warm
+& (Join-Path $PSScriptRoot 'play.ps1') -Exe $Exe -More $settings -Warm:$Warm -Safe:$Safe

@@ -28,17 +28,18 @@ layer's own frame reports, grouped by how many draws a frame had.
 
 | | |
 |---|---|
-| Open world, 3,000 to 6,000 draws a frame | about 40 ms a frame (25 fps); 80 ms in the session before, without the renderer patches |
-| Same, 6,000 to 9,000 draws | about 53 ms (19 fps); 99 ms before |
-| Over 9,000 draws (dense streets, the first minutes after loading) | 115 to 145 ms (7 to 9 fps) with draws left out: the first item under "What is known to be wrong" |
-| A session | about 17 fps over nine minutes in the world, 30 in light scenes (`scripts\play-9070xt.ps1`) |
-| The driver's shader compiler | no longer stops: 0 pipelines refused in two sessions (48 minutes), where 38 compute programs were refused in every frame before |
-| The first minutes of a run | at the session's frame rate after `-Warm` (4,336 pipelines made ahead in 310 s); 3 to 7 fps for six minutes without it |
-| Memory | 31 to 33 GB of private memory (a 32 GB PC pages, and the frame rate jumps with it), 11.4 GB of the card inside the 11.5 to 11.9 GB Windows gives the title, about 10 GB shared with it. AvatarManz measures 45 GB of RAM for this version on his 64 GB PC |
+| Open world, up to 3,000 draws a frame | about 42 ms a frame (24 fps) |
+| 3,000 to 6,000 draws | about 48 ms (21 fps); 80 ms before the renderer patches |
+| 6,000 to 9,000 draws | about 64 ms (16 fps); 99 ms before |
+| Over 9,000 draws (dense streets) | about 73 ms (14 fps); 115 to 145 ms before, with draws left out |
+| A session | 18.9 fps as the median of 27 minutes in the world, 26 of 319 five-second reports over 75 ms a frame and 8 over 100 (`scripts\play-9070xt.ps1`) |
+| The driver's shader compiler | no longer stops: 0 pipelines refused in any session since, where 38 compute programs were refused in every frame before |
+| The first minutes of a run | at the session's frame rate after `-Warm` (about 5,000 pipelines made ahead in five minutes, seconds after a rebuild that changes few); 3 to 7 fps for six minutes without it |
+| Memory | 27 to 29 GB of private memory, level over the last 15 minutes of that session (31 to 33 GB and rising before kripotker's memory series and the fix below); 10.7 GB of the card, about 7.5 GB shared with it. AvatarManz measures 45 GB of RAM for this version on his 64 GB PC |
 | Controls | pad, or keyboard and mouse (`VICTORY_MOUSE=1`: the mouse is the right stick and the triggers) |
 
 Two days of sessions on this PC went from an exit after three minutes (the
-driver) to 14 fps, and to about 20 in ordinary scenes.
+driver) to 14 fps, and to about 19 with far fewer dips.
 
 ### What this fork adds
 
@@ -49,16 +50,31 @@ driver) to 14 fps, and to about 20 in ordinary scenes.
 | `VICTORY_TEXTURE_MAX=<pixels>` or `auto` | Host copies of streamed block-compressed textures start at a smaller level as the card fills (1024, 512, then 256 pixels a side): about 1 GB of the card left free |
 | Placed views' filler words | The title leaves stack contents in the padding of its view descriptions, and every one was a new entry in a table that was full after 27 minutes; from then on the layer's own memory grew by about 200 MB a minute. They are zeroed (`VICTORY_VIEW_FILLER=1`: as before) |
 | `VICTORY_MOUSE=1` | Mouse look, mouse buttons as the triggers and a third-person PC key layout for the stand-in pad ([pull request 153](https://github.com/avatarmanz/VIctory-7900XTX/pull/153)) |
-| `scripts\play-9070xt.ps1` | The settings measured above in one place, and `-Warm` to make the pipelines ahead |
+| A view heap of 2^23 descriptors, searched by words | The slots for tables made per draw ran out in dense streets (up to 3,384 of 37,000 tables a frame refused, each a draw left out, and over a second of thread time a frame searching). The title's 1,245,184 slots left them 851,967 in a heap of 2^21 views; they are 2,097,152 now, and the search steps over whole words (`VICTORY_VIEW_HEAP_BITS=21`: the old heap) |
+| Idle textures stay while the card has room (`VICTORY_PRESSURE_CARD_PERCENT`, 70) | kripotker's rule lets idle texture copies go after 5 s while the PC is short of memory. Here the PC always is, and the copies are on the card: the rule now holds only from 70 % of the card's budget on |
+| `VICTORY_PANEL=2` | A wide panel in colours: frame rate, a graph of the last frames' times, the card and the processor with their load, memory (F3 shows and hides it) |
+| `scripts\play-9070xt.ps1` | The settings measured above in one place, `-Warm` to make the pipelines ahead, `-Safe` for the slower way without the mesh fault below |
 
-The launcher turns on AvatarManz's five renderer patches below, the title's own
-1440p output (`VICTORY_OUTPUT`), `VICTORY_TEXTURE_MAX=auto`, and two settings
-for textures that appear late: slots waiting for their memory are looked at
-every half second (`VICTORY_TEXTURE_LOOK_MS=500`; at 12 fps the looks came 8 to
-20 s apart), and a texture whose memory is away keeps what it showed for 15 s
-(`VICTORY_TEXTURE_AWAY_MS=15000`; made null 3 times a minute instead of 23).
+It also carries kripotker's memory series
+([pull request 206](https://github.com/avatarmanz/VIctory-7900XTX/pull/206), all
+of its commits but the one for the shapes, which this fork has its own of): with
+it the private memory fell from about 31.5 GB to 25 GB at the same point of a
+session and the pages read in from 11,400 a second to under 5,000.
 
-### AvatarManz's renderer patches (off by default; `play-9070xt.ps1` turns them on)
+The launcher turns on AvatarManz's renderer patches 2, 5, 6 and 7 below, the
+title's own 1440p output (`VICTORY_OUTPUT`), `VICTORY_TEXTURE_MAX=auto`, the
+panel, and two settings for textures that appear late: slots waiting for their
+memory are looked at every half second (`VICTORY_TEXTURE_LOOK_MS=500`; at 12 fps
+the looks came 8 to 20 s apart), and a texture whose memory is away keeps what
+it showed for 15 s (`VICTORY_TEXTURE_AWAY_MS=15000`; made null 3 times a minute
+instead of 23). It leaves two things of the tree's own launcher off, as measured
+here: renderer patch 1 (with `VICTORY_PORT_CONSTANTS=1` the sky flickered between
+dark and light; without it, not), and title memory read in place everywhere
+(`VICTORY_PORT_ALL`, `VICTORY_INPLACE`, 64 KiB windows: 9,296 small regions
+opened and 5,467 forgotten in three minutes, the frame rate swinging between 2
+and 20 fps).
+
+### AvatarManz's renderer patches (off by default; `play-9070xt.ps1` turns 2, 5, 6 and 7 on)
 
 | Switch | What it does |
 |---|---|
@@ -80,29 +96,36 @@ every half second (`VICTORY_TEXTURE_LOOK_MS=500`; at 12 fps the looks came 8 to
 
 What is known to be wrong:
 
-- **The first one or two minutes in the world, and dense streets, glitch**:
-  textures and whole objects come and go, at 4 to 7 fps. The host's descriptor
-  slots for tables made per draw run out: up to 3,300 of 37,000 tables a frame
-  are refused, about 1,900 indirect draws a frame are left out, and the search
-  for free slots takes over a second of thread time a frame. Seen with the
-  renderer patches on, not in the two sessions before them. Next to fix.
-- Textures of what just came into view appear late: of those that waited for
-  the title's memory, half took up to 8 s.
-- 32 GB is not enough yet: the PC pages, and long sessions get slower. The last
-  part of the filler fix (one more padding word) is unit-tested but has not been
-  through a play session.
-- One pipeline of 4,337 still ends the driver's compiler when made ahead; the
-  guard refuses it.
+- **A character's or a vehicle's mesh is at times drawn as large sheets of
+  polygons, with black or white patches on clothes**, most when the player
+  takes control after loading, and again now and then. (Things in the world
+  also flicker in and out; whether that is the same fault is not known.) It
+  comes with `VICTORY_THIN=1` (list calls written down and
+  translated by threads of ours a moment later), found by turning one thing off
+  at a time in seven short runs: the 2^23 heap, renderer patches 1, 6 and 7,
+  `VICTORY_UPLOAD_AHEAD`, `VICTORY_JOIN_PARTS`, `VICTORY_UNDER_WIDE` and
+  `VICTORY_LAND_ECHO` are not it; `-Safe` is clean, at 13 fps against 17 to 19.
+  Being worked on.
+- **The frame rate still jumps**: 8 % of the five-second reports are over 75 ms
+  a frame. A timeline of 68 frames says where: the title's `CopyPageMappings`
+  is the largest cause (14 % of all frame time, 193 and 209 ms in the two worst
+  frames), waiting behind the layer's own protection changes. More mapping
+  threads (`VICTORY_MAP_THREADS=auto`) only moved the wait.
+- Textures and plants of what just came into view appear late or come and go
+  when the card is near its budget: with a browser open Windows gave the title
+  11.9 GB of a 16 GB card, and 616,000 texture copies were let go and 323,000
+  made again in 20 minutes.
+- One pipeline of about 5,000 still ends the driver's compiler when made ahead;
+  the guard refuses it.
 - By day, ground and walls in the sun are far too bright, white in places.
   Light in shadow is AvatarManz's stand-in; ray tracing is off.
-- Now and then a character's or a vehicle's mesh is drawn as large sheets of
-  polygons fanning out from it for a moment (seen while getting into a car and
-  at a crash). The cause is not known yet.
+- A floor under the working set (`VICTORY_WORKING_SET_MB`) is not a way to keep
+  the title in memory: at 20,480 the host device was removed at world load.
 - With the mouse, the Caps Lock driving layout and F8 (frees the pointer) have
   not been tried in play.
-- What AvatarManz lists still holds: trees, signs and far objects flicker in
-  the distance in places, and light is too bright or too dark for a while after
-  walking indoors.
+- What AvatarManz lists still holds: far objects flicker in the distance in
+  places, and light is too bright or too dark for a while after walking
+  indoors.
 
 ## How to run it
 
@@ -111,8 +134,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title, on an SSD.
 
 ```powershell
-git clone https://github.com/mavis140/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/mavis140/mavis-9070xt
+cd mavis-9070xt
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-9070xt.ps1 -Exe <path of your copy's executable>
@@ -125,8 +148,9 @@ scripts\play-9070xt.ps1 -Exe <path of your copy's executable> -Warm   # five min
 ```
 
 - `-NoPorts` leaves the renderer patches out; try it when objects go missing
-  or the device is removed. `scripts\play.ps1` is AvatarManz's launcher with
-  none of this fork's settings (`-Safe`, `-RayTracing`).
+  or the device is removed. `-Safe` is the slower way without the mesh fault.
+  `scripts\play.ps1` is the tree's own launcher with none of this fork's
+  settings (`-Safe`, `-RayTracing`, `-Console series-s`).
 - `-Output 1920x1080` takes less of the card.
 - If an earlier build with the crash guard left `cache\pipelines\crashed.txt`
   in the layer's cache folder, delete it once: the pipelines in it stay refused.
