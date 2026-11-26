@@ -1625,8 +1625,19 @@ fn without_filler(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16])
     if !kept {
         resource[1] = 0;
         resource[13] = 0;
-        if !unordered {
+        // The last word of the ten: no kind of unordered view reaches it
+        // (a buffer's ends at word 8), and of the shader views only a 2D
+        // array's does (its lowest level's clamp). With the three words
+        // above gone it was what still made shapes: 2,003 values among
+        // the newest 4,096 shapes, 329,000 shapes nine minutes into a run.
+        const TEXTURE_2D_ARRAY: u32 = 5;
+        if unordered {
+            desc[9] = 0;
+        } else {
             desc[3] = 0;
+            if desc[1] != TEXTURE_2D_ARRAY {
+                desc[9] = 0;
+            }
         }
     }
     (resource, desc)
@@ -2041,7 +2052,7 @@ mod tests {
         let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         (resource[1], resource[13]) = (0, 0);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
-        desc[3] = 0;
+        (desc[3], desc[9]) = (0, 0);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,
@@ -2104,7 +2115,8 @@ mod tests {
         let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1[2..13] == middle[..]).count();
         create_placed_srv(null, &resource, &desc, at);
         for n in 0..1000u32 {
-            (resource[1], resource[13], desc[3]) = (n, !n, n.wrapping_mul(0x9e37_79b9));
+            (resource[1], resource[13]) = (n, !n);
+            (desc[3], desc[9]) = (n.wrapping_mul(0x9e37_79b9), n ^ 0x55aa);
             create_placed_srv(null, &resource, &desc, beside);
             assert_eq!(words(at), words(beside), "the same record whatever the filler");
         }
@@ -2112,21 +2124,35 @@ mod tests {
         let Some(View::Placed(false, kept, view_kept)) = view(at) else {
             panic!("a placed view");
         };
-        assert_eq!((kept[1], kept[13], view_kept[3]), (0, 0, 0));
-        assert_eq!((kept[2..13].to_vec(), view_kept[4..].to_vec()), (resource[2..13].to_vec(), desc[4..].to_vec()));
+        assert_eq!((kept[1], kept[13], view_kept[3], view_kept[9]), (0, 0, 0, 0));
+        assert_eq!(kept[2..13], resource[2..13]);
+        assert_eq!((&view_kept[4..9], &view_kept[10..]), (&desc[4..9], &desc[10..]));
         // Word 3 of an unordered view's description is part of it (the
-        // first element's high half): kept, and another shape.
+        // first element's high half): kept, and another shape. Its last
+        // word is filler too.
         create_placed_uav(null, &resource, &desc, at);
         desc[3] ^= 1;
+        desc[9] ^= 1;
         create_placed_uav(null, &resource, &desc, beside);
         assert_ne!(words(at), words(beside));
-        assert_eq!(view(beside), Some(View::Placed(true, kept, desc)));
+        let mut said = desc;
+        said[9] = 0;
+        assert_eq!(view(beside), Some(View::Placed(true, kept, said)));
         // A word that is part of a shader view (its first level) too.
         desc[4] ^= 1;
         create_placed_srv(null, &resource, &desc, at);
         desc[4] ^= 1;
         create_placed_srv(null, &resource, &desc, beside);
         assert_ne!(words(at), words(beside));
+        // A 2D array's last word is its lowest level's clamp: kept.
+        desc[1] = 5;
+        create_placed_srv(null, &resource, &desc, at);
+        desc[9] ^= 1;
+        create_placed_srv(null, &resource, &desc, beside);
+        assert_ne!(words(at), words(beside));
+        said = desc;
+        said[3] = 0;
+        assert_eq!(view(beside), Some(View::Placed(false, kept, said)));
     }
 
     /// A released resource's views go stale; the same view of a new
